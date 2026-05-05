@@ -143,6 +143,64 @@ func TestMultiIndexer_IndexAll_MultiRepo(t *testing.T) {
 	assert.Len(t, mi.AllMetadata(), 2)
 }
 
+func TestMultiIndexer_IndexAll_SingleRepoLoadsWorkspaceExclude(t *testing.T) {
+	dir := setupRepoDir(t, "myrepo")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "ignored"), 0o755))
+	writeFile(t, filepath.Join(dir, "ignored", "ignored.go"), "package main\nfunc Ignored() {}\n")
+	writeFile(t, filepath.Join(dir, ".gortex.yaml"), "exclude:\n  - ignored/**\n")
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{Repos: []config.RepoEntry{{Path: dir, Name: "myrepo"}}}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	g := graph.New()
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+
+	for _, n := range g.AllNodes() {
+		assert.NotContains(t, n.FilePath, "ignored/ignored.go")
+		assert.NotContains(t, n.ID, "Ignored")
+	}
+}
+
+func TestMultiIndexer_IndexAll_MultiRepoLoadsWorkspaceExclude(t *testing.T) {
+	repoA := setupRepoDir(t, "repo-a")
+	repoB := setupRepoDir(t, "repo-b")
+	require.NoError(t, os.MkdirAll(filepath.Join(repoA, "ignored"), 0o755))
+	writeFile(t, filepath.Join(repoA, "ignored", "ignored.go"), "package main\nfunc Ignored() {}\n")
+	writeFile(t, filepath.Join(repoA, ".gortex.yaml"), "exclude:\n  - ignored/**\n")
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{
+		Repos: []config.RepoEntry{
+			{Path: repoA, Name: "repo-a"},
+			{Path: repoB, Name: "repo-b"},
+		},
+	}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	g := graph.New()
+	mi := NewMultiIndexer(g, newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+
+	for _, n := range g.AllNodes() {
+		assert.NotContains(t, n.FilePath, "ignored/ignored.go")
+		assert.NotContains(t, n.ID, "Ignored")
+	}
+}
+
 func TestMultiIndexer_IndexRepo(t *testing.T) {
 	repoA := setupRepoDir(t, "repo-a")
 	repoB := setupRepoDir(t, "repo-b")

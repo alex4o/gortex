@@ -163,6 +163,7 @@ func (mi *MultiIndexer) indexSingleRepo(entry config.RepoEntry) (map[string]*Ind
 	}
 
 	prefix := config.ResolvePrefix(entry)
+	mi.configMgr.LoadWorkspaceConfig(prefix, absPath)
 	cfg := mi.configMgr.GetRepoConfig(prefix)
 
 	idx := New(mi.graph, mi.registry, cfg.Index, mi.logger)
@@ -249,6 +250,7 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 				return
 			}
 
+			mi.configMgr.LoadWorkspaceConfig(prefix, absPath)
 			cfg := mi.configMgr.GetRepoConfig(prefix)
 			idx := New(mi.graph, mi.registry, cfg.Index, mi.logger)
 			idx.search = mi.search
