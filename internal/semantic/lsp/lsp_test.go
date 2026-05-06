@@ -67,14 +67,22 @@ func TestLSP_JSONRPCError_Error(t *testing.T) {
 }
 
 func TestLSP_Provider_Available_FalseWhenMissing(t *testing.T) {
-	p := NewProvider("definitely-not-a-real-lsp-binary-xyz", nil, []string{"go"}, false, 0, zap.NewNop())
+	p := NewProvider("definitely-not-a-real-lsp-binary-xyz", nil, []string{"go"}, false, 0, 0, zap.NewNop())
 	assert.False(t, p.Available())
 	assert.Equal(t, "lsp-definitely-not-a-real-lsp-binary-xyz", p.Name())
 }
 
 func TestLSP_NewClient_FailsForBadCommand(t *testing.T) {
-	_, err := NewClient("/nonexistent/path/to/lsp", nil, t.TempDir(), zap.NewNop())
+	_, err := NewClient("/nonexistent/path/to/lsp", nil, t.TempDir(), zap.NewNop(), time.Second)
 	require.Error(t, err)
+}
+
+func TestLSP_Provider_UsesConfiguredTimeout(t *testing.T) {
+	p := NewProvider("fake-lsp", nil, []string{"typescript"}, true, 0, 7, zap.NewNop())
+	assert.Equal(t, 7*time.Second, p.requestTimeout)
+
+	p = NewProvider("fake-lsp", nil, []string{"typescript"}, true, 0, 0, zap.NewNop())
+	assert.Equal(t, 120*time.Second, p.requestTimeout)
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +223,24 @@ func TestLSP_Client_CallReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), "-32601")
 }
 
+func TestLSP_Client_CallTimesOut(t *testing.T) {
+	c, serverIn, _, cleanup := newPipedClient(t)
+	defer cleanup()
+	c.requestTimeout = 20 * time.Millisecond
+
+	// Drain the request but deliberately never answer it.
+	go func() {
+		_, _ = readFramed(serverIn)
+	}()
+
+	start := time.Now()
+	err := c.Call("test/hangs", nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timed out")
+	assert.Contains(t, err.Error(), "test/hangs")
+	assert.Less(t, time.Since(start), time.Second)
+}
+
 func TestLSP_Client_CallUnblocksOnServerExit(t *testing.T) {
 	c, serverIn, _, cleanup := newPipedClient(t)
 	defer cleanup()
@@ -234,6 +260,43 @@ func TestLSP_Client_CallUnblocksOnServerExit(t *testing.T) {
 	err := c.Call("test/method", nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exited")
+}
+
+func TestLSP_Client_AnswersServerRequests(t *testing.T) {
+	_, serverIn, serverOut, cleanup := newPipedClient(t)
+	defer cleanup()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		writeFramed(t, serverOut, map[string]any{
+			"jsonrpc": "2.0",
+			"id":      int64(99),
+			"method":  "workspace/configuration",
+			"params":  map[string]any{"items": []any{map[string]any{"section": "typescript"}}},
+		})
+		body, ok := readFramed(serverIn)
+		if !ok {
+			serverDone <- fmt.Errorf("server: unexpected EOF")
+			return
+		}
+		var resp jsonRPCResponse
+		if err := json.Unmarshal(body, &resp); err != nil {
+			serverDone <- err
+			return
+		}
+		if resp.ID != 99 || string(resp.Result) != "[null]" {
+			serverDone <- fmt.Errorf("unexpected response: id=%d result=%s", resp.ID, string(resp.Result))
+			return
+		}
+		serverDone <- nil
+	}()
+
+	select {
+	case err := <-serverDone:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not answer server request")
+	}
 }
 
 func TestLSP_Client_NotifyDoesNotWaitForResponse(t *testing.T) {

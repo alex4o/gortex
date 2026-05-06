@@ -25,7 +25,8 @@ import (
 // ---------------------------------------------------------------------------
 
 type fakeLSPServer struct {
-	handlers map[string]func(params json.RawMessage) (any, *jsonRPCError)
+	handlers             map[string]func(params json.RawMessage) (any, *jsonRPCError)
+	notificationHandlers map[string]func(params json.RawMessage)
 
 	mu       sync.Mutex
 	notifLog []string
@@ -33,12 +34,17 @@ type fakeLSPServer struct {
 
 func newFakeLSPServer() *fakeLSPServer {
 	return &fakeLSPServer{
-		handlers: make(map[string]func(json.RawMessage) (any, *jsonRPCError)),
+		handlers:             make(map[string]func(json.RawMessage) (any, *jsonRPCError)),
+		notificationHandlers: make(map[string]func(json.RawMessage)),
 	}
 }
 
 func (f *fakeLSPServer) handle(method string, fn func(params json.RawMessage) (any, *jsonRPCError)) {
 	f.handlers[method] = fn
+}
+
+func (f *fakeLSPServer) handleNotification(method string, fn func(params json.RawMessage)) {
+	f.notificationHandlers[method] = fn
 }
 
 func (f *fakeLSPServer) notifications() []string {
@@ -71,6 +77,14 @@ func (f *fakeLSPServer) run(in *bufio.Reader, out io.Writer) {
 			f.mu.Lock()
 			f.notifLog = append(f.notifLog, probe.Method)
 			f.mu.Unlock()
+			if h, ok := f.notificationHandlers[probe.Method]; ok {
+				var notif struct {
+					Params json.RawMessage `json:"params"`
+				}
+				if err := json.Unmarshal(body, &notif); err == nil {
+					h(notif.Params)
+				}
+			}
 			continue
 		}
 
@@ -117,7 +131,7 @@ func providerWithFakeServer(t *testing.T, server *fakeLSPServer, languages []str
 
 	go server.run(serverIn, serverOut)
 
-	p := NewProvider("fake-lsp", nil, languages, false, 0, zap.NewNop())
+	p := NewProvider("fake-lsp", nil, languages, false, 0, 0, zap.NewNop())
 	p.client = c // skip ensureClient — the client is already wired.
 	return p, cleanup
 }
@@ -125,6 +139,21 @@ func providerWithFakeServer(t *testing.T, server *fakeLSPServer, languages []str
 // ---------------------------------------------------------------------------
 // Tests for Provider.Enrich orchestration.
 // ---------------------------------------------------------------------------
+
+func TestLSP_LanguageID_UsesReactVariants(t *testing.T) {
+	assert.Equal(t, "typescriptreact", lspLanguageID("src/App.tsx", []string{"typescript"}))
+	assert.Equal(t, "javascriptreact", lspLanguageID("src/App.jsx", []string{"javascript"}))
+	assert.Equal(t, "typescript", lspLanguageID("src/main.ts", []string{"javascript"}))
+}
+
+func TestLSP_DiskRelPath_StripsRepoPrefixWhenNeeded(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(repoRoot, "apps", "web"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "apps", "web", "main.ts"), []byte("export const x = 1\n"), 0o644))
+
+	assert.Equal(t, "apps/web/main.ts", diskRelPath(repoRoot, "kmono/apps/web/main.ts"))
+	assert.Equal(t, "apps/web/main.ts", diskRelPath(repoRoot, "apps/web/main.ts"))
+}
 
 func TestLSP_Provider_EnrichesNodeMetaFromHover(t *testing.T) {
 	repoRoot := t.TempDir()
@@ -135,7 +164,11 @@ func TestLSP_Provider_EnrichesNodeMetaFromHover(t *testing.T) {
 	))
 
 	server := newFakeLSPServer()
+	gotHoverPosition := make(chan Position, 1)
 	server.handle("textDocument/hover", func(params json.RawMessage) (any, *jsonRPCError) {
+		var hoverParams HoverParams
+		_ = json.Unmarshal(params, &hoverParams)
+		gotHoverPosition <- hoverParams.Position
 		return HoverResult{
 			Contents: MarkupContent{Kind: "plaintext", Value: "func F() string"},
 		}, nil
@@ -166,6 +199,13 @@ func TestLSP_Provider_EnrichesNodeMetaFromHover(t *testing.T) {
 	require.NotNil(t, node.Meta)
 	assert.Equal(t, "func F() string", node.Meta["semantic_type"])
 	assert.Equal(t, "lsp-fake-lsp", node.Meta["semantic_source"])
+
+	select {
+	case pos := <-gotHoverPosition:
+		assert.Equal(t, Position{Line: 2, Character: 5}, pos)
+	default:
+		t.Fatal("fake server did not receive hover request")
+	}
 
 	// didOpen should have been sent for main.go.
 	assert.Contains(t, server.notifications(), "textDocument/didOpen")
@@ -530,4 +570,47 @@ func TestLSP_Provider_EnrichSurvivesHoverFailures(t *testing.T) {
 		}
 	}
 	assert.GreaterOrEqual(t, enriched, 1, "at least one node should have been enriched despite a failed hover")
+}
+
+func TestLSP_Provider_SkipsUnsupportedExtensions(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "theme.css"), []byte(".x { color: red; }\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "main.ts"), []byte("export function ok() { return 1 }\n"), 0o644))
+
+	opened := make(chan string, 2)
+	server := newFakeLSPServer()
+	server.handleNotification("textDocument/didOpen", func(params json.RawMessage) {
+		var openParams DidOpenTextDocumentParams
+		_ = json.Unmarshal(params, &openParams)
+		opened <- openParams.TextDocument.URI
+	})
+	server.handle("textDocument/hover", func(params json.RawMessage) (any, *jsonRPCError) {
+		return HoverResult{Contents: MarkupContent{Kind: "plaintext", Value: "function ok(): number"}}, nil
+	})
+
+	p, cleanup := providerWithFakeServer(t, server, []string{"typescript", "javascript"})
+	defer cleanup()
+
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "theme.css::bad", Kind: graph.KindFunction, Name: "bad", FilePath: "theme.css", StartLine: 1, EndLine: 1, Language: "typescript"})
+	g.AddNode(&graph.Node{ID: "main.ts::ok", Kind: graph.KindFunction, Name: "ok", FilePath: "main.ts", StartLine: 1, EndLine: 1, Language: "typescript"})
+
+	res, err := p.Enrich(g, repoRoot)
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.SymbolsTotal)
+	assert.Nil(t, g.GetNode("theme.css::bad").Meta)
+	assert.NotNil(t, g.GetNode("main.ts::ok").Meta)
+
+	select {
+	case uri := <-opened:
+		assert.Contains(t, uri, "main.ts")
+		assert.NotContains(t, uri, "theme.css")
+	case <-time.After(time.Second):
+		t.Fatal("expected didOpen for supported file")
+	}
+	select {
+	case uri := <-opened:
+		assert.NotContains(t, uri, "theme.css")
+	default:
+	}
 }
