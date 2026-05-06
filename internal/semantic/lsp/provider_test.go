@@ -25,7 +25,8 @@ import (
 // ---------------------------------------------------------------------------
 
 type fakeLSPServer struct {
-	handlers map[string]func(params json.RawMessage) (any, *jsonRPCError)
+	handlers             map[string]func(params json.RawMessage) (any, *jsonRPCError)
+	notificationHandlers map[string]func(params json.RawMessage)
 
 	mu       sync.Mutex
 	notifLog []string
@@ -33,12 +34,17 @@ type fakeLSPServer struct {
 
 func newFakeLSPServer() *fakeLSPServer {
 	return &fakeLSPServer{
-		handlers: make(map[string]func(json.RawMessage) (any, *jsonRPCError)),
+		handlers:             make(map[string]func(json.RawMessage) (any, *jsonRPCError)),
+		notificationHandlers: make(map[string]func(json.RawMessage)),
 	}
 }
 
 func (f *fakeLSPServer) handle(method string, fn func(params json.RawMessage) (any, *jsonRPCError)) {
 	f.handlers[method] = fn
+}
+
+func (f *fakeLSPServer) handleNotification(method string, fn func(params json.RawMessage)) {
+	f.notificationHandlers[method] = fn
 }
 
 func (f *fakeLSPServer) notifications() []string {
@@ -71,6 +77,14 @@ func (f *fakeLSPServer) run(in *bufio.Reader, out io.Writer) {
 			f.mu.Lock()
 			f.notifLog = append(f.notifLog, probe.Method)
 			f.mu.Unlock()
+			if h, ok := f.notificationHandlers[probe.Method]; ok {
+				var notif struct {
+					Params json.RawMessage `json:"params"`
+				}
+				if err := json.Unmarshal(body, &notif); err == nil {
+					h(notif.Params)
+				}
+			}
 			continue
 		}
 
@@ -117,7 +131,7 @@ func providerWithFakeServer(t *testing.T, server *fakeLSPServer, languages []str
 
 	go server.run(serverIn, serverOut)
 
-	p := NewProvider("fake-lsp", nil, languages, false, 0, zap.NewNop())
+	p := NewProvider("fake-lsp", nil, languages, false, 0, 0, zap.NewNop())
 	p.client = c // skip ensureClient — the client is already wired.
 	return p, cleanup
 }
@@ -125,6 +139,21 @@ func providerWithFakeServer(t *testing.T, server *fakeLSPServer, languages []str
 // ---------------------------------------------------------------------------
 // Tests for Provider.Enrich orchestration.
 // ---------------------------------------------------------------------------
+
+func TestLSP_LanguageID_UsesReactVariants(t *testing.T) {
+	assert.Equal(t, "typescriptreact", lspLanguageID("src/App.tsx", []string{"typescript"}))
+	assert.Equal(t, "javascriptreact", lspLanguageID("src/App.jsx", []string{"javascript"}))
+	assert.Equal(t, "typescript", lspLanguageID("src/main.ts", []string{"javascript"}))
+}
+
+func TestLSP_DiskRelPath_StripsRepoPrefixWhenNeeded(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(repoRoot, "apps", "web"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "apps", "web", "main.ts"), []byte("export const x = 1\n"), 0o644))
+
+	assert.Equal(t, "apps/web/main.ts", diskRelPath(repoRoot, "kmono/apps/web/main.ts"))
+	assert.Equal(t, "apps/web/main.ts", diskRelPath(repoRoot, "apps/web/main.ts"))
+}
 
 func TestLSP_Provider_EnrichesNodeMetaFromHover(t *testing.T) {
 	repoRoot := t.TempDir()
@@ -135,7 +164,11 @@ func TestLSP_Provider_EnrichesNodeMetaFromHover(t *testing.T) {
 	))
 
 	server := newFakeLSPServer()
+	gotHoverPosition := make(chan Position, 1)
 	server.handle("textDocument/hover", func(params json.RawMessage) (any, *jsonRPCError) {
+		var hoverParams HoverParams
+		_ = json.Unmarshal(params, &hoverParams)
+		gotHoverPosition <- hoverParams.Position
 		return HoverResult{
 			Contents: MarkupContent{Kind: "plaintext", Value: "func F() string"},
 		}, nil
@@ -166,6 +199,13 @@ func TestLSP_Provider_EnrichesNodeMetaFromHover(t *testing.T) {
 	require.NotNil(t, node.Meta)
 	assert.Equal(t, "func F() string", node.Meta["semantic_type"])
 	assert.Equal(t, "lsp-fake-lsp", node.Meta["semantic_source"])
+
+	select {
+	case pos := <-gotHoverPosition:
+		assert.Equal(t, Position{Line: 2, Character: 5}, pos)
+	default:
+		t.Fatal("fake server did not receive hover request")
+	}
 
 	// didOpen should have been sent for main.go.
 	assert.Contains(t, server.notifications(), "textDocument/didOpen")

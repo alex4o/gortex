@@ -53,6 +53,7 @@ func (m *Manager) EnrichAll(g *graph.Graph, roots map[string]string) ([]*EnrichR
 	langProviders := m.selectProviders()
 
 	var results []*EnrichResult
+	runOnce := make(map[string]bool)
 
 	for lang, provider := range langProviders {
 		if !provider.Available() {
@@ -63,8 +64,16 @@ func (m *Manager) EnrichAll(g *graph.Graph, roots map[string]string) ([]*EnrichR
 			continue
 		}
 
-		// Run enrichment for each repo root.
+		// Run enrichment for each repo root. A provider may advertise multiple
+		// languages; run it once per repo, not once per language, or LSP/SCIP
+		// providers do duplicate full-graph work.
 		for repoName, repoRoot := range roots {
+			runKey := provider.Name() + "\x00" + repoName
+			if runOnce[runKey] {
+				continue
+			}
+			runOnce[runKey] = true
+
 			start := time.Now()
 			m.logger.Info("semantic enrichment starting",
 				zap.String("provider", provider.Name()),

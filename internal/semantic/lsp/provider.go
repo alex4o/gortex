@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -17,28 +18,35 @@ import (
 
 // Provider uses an LSP server for on-demand semantic queries.
 type Provider struct {
-	command     string
-	args        []string
-	languages   []string
-	daemon      bool
-	maxParallel int
-	logger      *zap.Logger
+	command        string
+	args           []string
+	languages      []string
+	daemon         bool
+	maxParallel    int
+	requestTimeout time.Duration
+	logger         *zap.Logger
 
-	client *Client
+	runMu      sync.Mutex
+	client     *Client
+	clientRoot string
 }
 
 // NewProvider creates an LSP provider.
-func NewProvider(command string, args []string, languages []string, daemon bool, maxParallel int, logger *zap.Logger) *Provider {
+func NewProvider(command string, args []string, languages []string, daemon bool, maxParallel, timeoutSec int, logger *zap.Logger) *Provider {
 	if maxParallel <= 0 {
 		maxParallel = 10
 	}
+	if timeoutSec <= 0 {
+		timeoutSec = 120
+	}
 	return &Provider{
-		command:     command,
-		args:        args,
-		languages:   languages,
-		daemon:      daemon,
-		maxParallel: maxParallel,
-		logger:      logger,
+		command:        command,
+		args:           args,
+		languages:      languages,
+		daemon:         daemon,
+		maxParallel:    maxParallel,
+		requestTimeout: time.Duration(timeoutSec) * time.Second,
+		logger:         logger,
 	}
 }
 
@@ -51,13 +59,21 @@ func (p *Provider) Available() bool {
 }
 
 func (p *Provider) Close() error {
+	p.runMu.Lock()
+	defer p.runMu.Unlock()
 	if p.client != nil {
-		return p.client.Shutdown()
+		err := p.client.Shutdown()
+		p.client = nil
+		p.clientRoot = ""
+		return err
 	}
 	return nil
 }
 
 func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResult, error) {
+	p.runMu.Lock()
+	defer p.runMu.Unlock()
+
 	start := time.Now()
 
 	absRoot, err := filepath.Abs(repoRoot)
@@ -90,14 +106,7 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 		if fromNode == nil {
 			continue
 		}
-		langMatch := false
-		for _, lang := range p.languages {
-			if fromNode.Language == lang {
-				langMatch = true
-				break
-			}
-		}
-		if langMatch {
+		if p.nodeMatches(fromNode, absRoot) {
 			targets = append(targets, enrichTarget{node: fromNode, edge: e})
 		}
 	}
@@ -107,86 +116,99 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
-		for _, lang := range p.languages {
-			if n.Language == lang {
-				result.SymbolsTotal++
-				break
-			}
+		if p.nodeMatches(n, absRoot) {
+			result.SymbolsTotal++
 		}
 	}
 
 	// Open documents for files that have targets.
 	openedFiles := make(map[string]bool)
 	for _, t := range targets {
-		if !openedFiles[t.node.FilePath] {
-			if err := p.openDocument(absRoot, t.node.FilePath); err != nil {
+		diskPath := diskRelPath(absRoot, t.node.FilePath)
+		if !openedFiles[diskPath] {
+			if err := p.openDocument(absRoot, diskPath); err != nil {
 				p.logger.Debug("LSP: failed to open document",
 					zap.String("file", t.node.FilePath),
+					zap.String("disk_path", diskPath),
 					zap.Error(err),
 				)
 				continue
 			}
-			openedFiles[t.node.FilePath] = true
+			openedFiles[diskPath] = true
 		}
 	}
 
 	// Query hover info for nodes to enrich metadata.
-	enrichedNodes := make(map[string]bool)
+	var hoverNodes []*graph.Node
 	for _, n := range g.AllNodes() {
 		if n.Kind == graph.KindFile || n.Kind == graph.KindImport {
 			continue
 		}
-		langMatch := false
-		for _, lang := range p.languages {
-			if n.Language == lang {
-				langMatch = true
-				break
-			}
-		}
-		if !langMatch {
+		if !p.nodeMatches(n, absRoot) {
 			continue
 		}
 
-		if !openedFiles[n.FilePath] {
-			if err := p.openDocument(absRoot, n.FilePath); err != nil {
+		diskPath := diskRelPath(absRoot, n.FilePath)
+		if !openedFiles[diskPath] {
+			if err := p.openDocument(absRoot, diskPath); err != nil {
 				continue
 			}
-			openedFiles[n.FilePath] = true
+			openedFiles[diskPath] = true
 		}
-
-		hoverResult, err := p.hover(absRoot, n.FilePath, n.StartLine-1, 0)
-		if err != nil || hoverResult == nil {
-			continue
-		}
-
-		typeInfo := extractTypeFromHover(hoverResult.Contents.Value)
-		if typeInfo != "" {
-			semantic.EnrichNodeMeta(n, "semantic_type", typeInfo, p.Name())
-			if !enrichedNodes[n.ID] {
-				result.NodesEnriched++
-				result.SymbolsCovered++
-				enrichedNodes[n.ID] = true
-			}
-		}
+		hoverNodes = append(hoverNodes, n)
 	}
+
+	enrichedNodes := make(map[string]bool)
+	var enrichMu sync.Mutex
+	workCh := make(chan *graph.Node)
+	var wg sync.WaitGroup
+	workers := p.maxParallel
+	if workers <= 0 {
+		workers = 1
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := range workCh {
+				diskPath := diskRelPath(absRoot, n.FilePath)
+				hoverResult, err := p.hover(absRoot, diskPath, n.StartLine-1, symbolColumn(absRoot, diskPath, n.StartLine, n.Name))
+				if err != nil || hoverResult == nil {
+					continue
+				}
+
+				typeInfo := extractTypeFromHover(hoverResult.Contents.Value)
+				if typeInfo == "" {
+					continue
+				}
+				semantic.EnrichNodeMeta(n, "semantic_type", typeInfo, p.Name())
+				enrichMu.Lock()
+				if !enrichedNodes[n.ID] {
+					result.NodesEnriched++
+					result.SymbolsCovered++
+					enrichedNodes[n.ID] = true
+				}
+				enrichMu.Unlock()
+			}
+		}()
+	}
+	for _, n := range hoverNodes {
+		workCh <- n
+	}
+	close(workCh)
+	wg.Wait()
 
 	// Query implementations for interface nodes.
 	for _, n := range g.AllNodes() {
 		if n.Kind != graph.KindInterface {
 			continue
 		}
-		langMatch := false
-		for _, lang := range p.languages {
-			if n.Language == lang {
-				langMatch = true
-				break
-			}
-		}
-		if !langMatch {
+		if !p.nodeMatches(n, absRoot) {
 			continue
 		}
 
-		impls, err := p.findImplementations(absRoot, n.FilePath, n.StartLine-1, 0)
+		diskPath := diskRelPath(absRoot, n.FilePath)
+		impls, err := p.findImplementations(absRoot, diskPath, n.StartLine-1, symbolColumn(absRoot, diskPath, n.StartLine, n.Name))
 		if err != nil || len(impls) == 0 {
 			continue
 		}
@@ -196,7 +218,7 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 			if implPath == "" {
 				continue
 			}
-			implNode := semantic.MatchNodeByFileLine(g, implPath, loc.Range.Start.Line+1)
+			implNode := matchNodeByFileLine(g, implPath, loc.Range.Start.Line+1)
 			if implNode == nil {
 				continue
 			}
@@ -218,11 +240,12 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 	// Query references for AMBIGUOUS edges to confirm/refute.
 	for _, t := range targets {
 		toNode := g.GetNode(t.edge.To)
-		if toNode == nil {
+		if toNode == nil || !p.nodeMatches(toNode, absRoot) {
 			continue
 		}
 
-		refs, err := p.findReferences(absRoot, toNode.FilePath, toNode.StartLine-1, 0)
+		toDiskPath := diskRelPath(absRoot, toNode.FilePath)
+		refs, err := p.findReferences(absRoot, toDiskPath, toNode.StartLine-1, symbolColumn(absRoot, toDiskPath, toNode.StartLine, toNode.Name))
 		if err != nil || len(refs) == 0 {
 			continue
 		}
@@ -231,7 +254,7 @@ func (p *Provider) Enrich(g *graph.Graph, repoRoot string) (*semantic.EnrichResu
 		confirmed := false
 		for _, ref := range refs {
 			refPath := uriToPath(ref.URI, absRoot)
-			if refPath == t.node.FilePath &&
+			if sameGraphOrDiskPath(refPath, t.node.FilePath) &&
 				ref.Range.Start.Line+1 >= t.node.StartLine &&
 				ref.Range.Start.Line+1 <= t.node.EndLine {
 				confirmed = true
@@ -259,13 +282,34 @@ func (p *Provider) EnrichFile(g *graph.Graph, repoRoot, filePath string) (*seman
 	return nil, nil
 }
 
+func (p *Provider) nodeMatches(n *graph.Node, repoRoot string) bool {
+	if n == nil {
+		return false
+	}
+	return p.languageMatches(n.Language)
+}
+
+func (p *Provider) languageMatches(language string) bool {
+	for _, lang := range p.languages {
+		if language == lang {
+			return true
+		}
+	}
+	return false
+}
+
 // ensureClient starts the LSP server if not already running.
 func (p *Provider) ensureClient(workspaceRoot string) error {
 	if p.client != nil {
-		return nil
+		if p.clientRoot == "" || p.clientRoot == workspaceRoot {
+			return nil
+		}
+		_ = p.client.Shutdown()
+		p.client = nil
+		p.clientRoot = ""
 	}
 
-	client, err := NewClient(p.command, p.args, workspaceRoot, p.logger)
+	client, err := NewClient(p.command, p.args, workspaceRoot, p.logger, p.requestTimeout)
 	if err != nil {
 		return err
 	}
@@ -297,6 +341,7 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 	}
 
 	p.client = client
+	p.clientRoot = workspaceRoot
 	return nil
 }
 
@@ -308,10 +353,7 @@ func (p *Provider) openDocument(repoRoot, relPath string) error {
 		return err
 	}
 
-	langID := "go" // default
-	if len(p.languages) > 0 {
-		langID = p.languages[0]
-	}
+	langID := lspLanguageID(relPath, p.languages)
 
 	return p.client.Notify("textDocument/didOpen", DidOpenTextDocumentParams{
 		TextDocument: TextDocumentItem{
@@ -378,6 +420,60 @@ func (p *Provider) findReferences(repoRoot, relPath string, line, col int) ([]Lo
 	return locations, nil
 }
 
+func lspLanguageID(relPath string, languages []string) string {
+	switch strings.ToLower(filepath.Ext(relPath)) {
+	case ".tsx":
+		return "typescriptreact"
+	case ".ts", ".mts", ".cts":
+		return "typescript"
+	case ".jsx":
+		return "javascriptreact"
+	case ".js", ".mjs", ".cjs":
+		return "javascript"
+	}
+	if len(languages) > 0 {
+		return languages[0]
+	}
+	return "go"
+}
+
+func diskRelPath(repoRoot, graphPath string) string {
+	if graphPath == "" || filepath.IsAbs(graphPath) {
+		return graphPath
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, graphPath)); err == nil {
+		return graphPath
+	}
+	parts := strings.SplitN(filepath.ToSlash(graphPath), "/", 2)
+	if len(parts) == 2 {
+		if _, err := os.Stat(filepath.Join(repoRoot, parts[1])); err == nil {
+			return parts[1]
+		}
+	}
+	return graphPath
+}
+
+func sameGraphOrDiskPath(a, b string) bool {
+	a = filepath.ToSlash(a)
+	b = filepath.ToSlash(b)
+	return a == b || strings.HasSuffix(a, "/"+b) || strings.HasSuffix(b, "/"+a)
+}
+
+func matchNodeByFileLine(g *graph.Graph, filePath string, line int) *graph.Node {
+	if n := semantic.MatchNodeByFileLine(g, filePath, line); n != nil {
+		return n
+	}
+	for _, candidate := range g.AllNodes() {
+		if candidate.Kind == graph.KindFile || candidate.Kind == graph.KindImport {
+			continue
+		}
+		if sameGraphOrDiskPath(filePath, candidate.FilePath) && candidate.StartLine <= line && line <= candidate.EndLine {
+			return candidate
+		}
+	}
+	return nil
+}
+
 // pathToURI converts a file path to a file:// URI.
 func pathToURI(path string) string {
 	absPath, _ := filepath.Abs(path)
@@ -401,10 +497,37 @@ func uriToPath(uri, repoRoot string) string {
 	return filepath.ToSlash(rel)
 }
 
+// symbolColumn returns a best-effort zero-based column for name on line. LSP
+// queries at column 0 often hit whitespace/export keywords and return nothing.
+func symbolColumn(repoRoot, relPath string, line int, name string) int {
+	if line <= 0 || name == "" {
+		return 0
+	}
+	content, err := os.ReadFile(filepath.Join(repoRoot, relPath))
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(string(content), "\n")
+	if line > len(lines) {
+		return 0
+	}
+	needle := name
+	if i := strings.LastIndex(needle, "."); i >= 0 && i+1 < len(needle) {
+		needle = needle[i+1:]
+	}
+	idx := strings.Index(lines[line-1], needle)
+	if idx < 0 {
+		return 0
+	}
+	return idx
+}
+
 // extractTypeFromHover extracts type information from hover text.
 func extractTypeFromHover(hover string) string {
 	// Remove markdown code fences.
-	hover = strings.TrimPrefix(hover, "```go\n")
+	for _, lang := range []string{"go", "typescript", "javascript", "ts", "js"} {
+		hover = strings.TrimPrefix(hover, "```"+lang+"\n")
+	}
 	hover = strings.TrimPrefix(hover, "```\n")
 	hover = strings.TrimSuffix(hover, "\n```")
 	hover = strings.TrimSpace(hover)
@@ -413,10 +536,16 @@ func extractTypeFromHover(hover string) string {
 	if len(lines) > 0 {
 		line := strings.TrimSpace(lines[0])
 		if strings.HasPrefix(line, "func ") ||
+			strings.HasPrefix(line, "function ") ||
 			strings.HasPrefix(line, "type ") ||
+			strings.HasPrefix(line, "interface ") ||
+			strings.HasPrefix(line, "class ") ||
+			strings.HasPrefix(line, "namespace ") ||
 			strings.HasPrefix(line, "var ") ||
+			strings.HasPrefix(line, "let ") ||
 			strings.HasPrefix(line, "const ") ||
 			strings.HasPrefix(line, "field ") ||
+			strings.HasPrefix(line, "property ") ||
 			strings.HasPrefix(line, "package ") {
 			return line
 		}

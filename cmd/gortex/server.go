@@ -225,7 +225,7 @@ func runServer(_ *cobra.Command, _ []string) error {
 			case strings.HasPrefix(pc.Name, "scip-") && pc.Command != "":
 				semMgr.RegisterProvider(scip.NewProvider(pc.Command, pc.Args, pc.Languages, semCfg.TimeoutSeconds, logger))
 			case strings.HasPrefix(pc.Name, "gopls") || pc.Daemon:
-				semMgr.RegisterProvider(lsp.NewProvider(pc.Command, pc.Args, pc.Languages, pc.Daemon, pc.MaxParallel, logger))
+				semMgr.RegisterProvider(lsp.NewProvider(pc.Command, pc.Args, pc.Languages, pc.Daemon, pc.MaxParallel, semCfg.TimeoutSeconds, logger))
 			}
 		}
 
@@ -265,6 +265,9 @@ func runServer(_ *cobra.Command, _ []string) error {
 		mi = indexer.NewMultiIndexer(g, reg, idx.Search(), cm, logger)
 		if embedder != nil {
 			mi.SetEmbedder(embedder)
+		}
+		if semMgr := idx.SemanticManager(); semMgr != nil {
+			mi.SetSemanticManager(semMgr)
 		}
 	}
 

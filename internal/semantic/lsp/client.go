@@ -11,19 +11,21 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 )
 
 // Client manages a JSON-RPC 2.0 connection to an LSP server subprocess.
 type Client struct {
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  *bufio.Reader
-	reqID   atomic.Int64
-	pending sync.Map // reqID → chan *jsonRPCResponse
-	logger  *zap.Logger
-	done    chan struct{}
+	cmd            *exec.Cmd
+	stdin          io.WriteCloser
+	stdout         *bufio.Reader
+	reqID          atomic.Int64
+	pending        sync.Map // reqID → chan *jsonRPCResponse
+	logger         *zap.Logger
+	done           chan struct{}
+	requestTimeout time.Duration
 
 	mu     sync.Mutex
 	closed bool
@@ -62,7 +64,7 @@ func (e *jsonRPCError) Error() string {
 }
 
 // NewClient spawns an LSP server subprocess and returns a connected client.
-func NewClient(command string, args []string, workspaceRoot string, logger *zap.Logger) (*Client, error) {
+func NewClient(command string, args []string, workspaceRoot string, logger *zap.Logger, requestTimeout time.Duration) (*Client, error) {
 	cmd := exec.Command(command, args...)
 	cmd.Dir = workspaceRoot
 	cmd.Stderr = os.Stderr
@@ -82,11 +84,12 @@ func NewClient(command string, args []string, workspaceRoot string, logger *zap.
 	}
 
 	c := &Client{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: bufio.NewReader(stdout),
-		logger: logger,
-		done:   make(chan struct{}),
+		cmd:            cmd,
+		stdin:          stdin,
+		stdout:         bufio.NewReader(stdout),
+		logger:         logger,
+		done:           make(chan struct{}),
+		requestTimeout: requestTimeout,
 	}
 
 	// Start response reader goroutine.
@@ -115,18 +118,35 @@ func (c *Client) Call(method string, params any, result any) error {
 	}
 
 	// Wait for response.
+	if c.requestTimeout > 0 {
+		timer := time.NewTimer(c.requestTimeout)
+		defer timer.Stop()
+		select {
+		case resp := <-respCh:
+			return decodeResponse(resp, result)
+		case <-c.done:
+			return fmt.Errorf("LSP server exited")
+		case <-timer.C:
+			return fmt.Errorf("LSP request %s timed out after %s", method, c.requestTimeout)
+		}
+	}
+
 	select {
 	case resp := <-respCh:
-		if resp.Error != nil {
-			return resp.Error
-		}
-		if result != nil && len(resp.Result) > 0 {
-			return json.Unmarshal(resp.Result, result)
-		}
-		return nil
+		return decodeResponse(resp, result)
 	case <-c.done:
 		return fmt.Errorf("LSP server exited")
 	}
+}
+
+func decodeResponse(resp *jsonRPCResponse, result any) error {
+	if resp.Error != nil {
+		return resp.Error
+	}
+	if result != nil && len(resp.Result) > 0 {
+		return json.Unmarshal(resp.Result, result)
+	}
+	return nil
 }
 
 // Notify sends a notification (no response expected).
@@ -218,6 +238,19 @@ func (c *Client) readResponses() {
 			return
 		}
 
+		var probe struct {
+			ID     json.RawMessage `json:"id,omitempty"`
+			Method string          `json:"method,omitempty"`
+		}
+		if err := json.Unmarshal(body, &probe); err != nil {
+			c.logger.Debug("LSP: failed to parse message", zap.Error(err))
+			continue
+		}
+		if len(probe.ID) > 0 && probe.Method != "" {
+			c.respondToServerRequest(probe.ID, probe.Method, body)
+			continue
+		}
+
 		// Parse response.
 		var resp jsonRPCResponse
 		if err := json.Unmarshal(body, &resp); err != nil {
@@ -229,5 +262,30 @@ func (c *Client) readResponses() {
 		if ch, ok := c.pending.Load(resp.ID); ok {
 			ch.(chan *jsonRPCResponse) <- &resp
 		}
+	}
+}
+
+func (c *Client) respondToServerRequest(id json.RawMessage, method string, body []byte) {
+	result := json.RawMessage("null")
+	if method == "workspace/configuration" {
+		var req struct {
+			Params struct {
+				Items []any `json:"items"`
+			} `json:"params"`
+		}
+		_ = json.Unmarshal(body, &req)
+		items := make([]any, len(req.Params.Items))
+		raw, err := json.Marshal(items)
+		if err == nil {
+			result = raw
+		}
+	}
+	resp := struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  json.RawMessage `json:"result"`
+	}{JSONRPC: "2.0", ID: id, Result: result}
+	if err := c.send(resp); err != nil {
+		c.logger.Debug("LSP: failed to answer server request", zap.String("method", method), zap.Error(err))
 	}
 }
