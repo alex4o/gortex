@@ -571,3 +571,46 @@ func TestLSP_Provider_EnrichSurvivesHoverFailures(t *testing.T) {
 	}
 	assert.GreaterOrEqual(t, enriched, 1, "at least one node should have been enriched despite a failed hover")
 }
+
+func TestLSP_Provider_SkipsUnsupportedExtensions(t *testing.T) {
+	repoRoot := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "theme.css"), []byte(".x { color: red; }\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repoRoot, "main.ts"), []byte("export function ok() { return 1 }\n"), 0o644))
+
+	opened := make(chan string, 2)
+	server := newFakeLSPServer()
+	server.handleNotification("textDocument/didOpen", func(params json.RawMessage) {
+		var openParams DidOpenTextDocumentParams
+		_ = json.Unmarshal(params, &openParams)
+		opened <- openParams.TextDocument.URI
+	})
+	server.handle("textDocument/hover", func(params json.RawMessage) (any, *jsonRPCError) {
+		return HoverResult{Contents: MarkupContent{Kind: "plaintext", Value: "function ok(): number"}}, nil
+	})
+
+	p, cleanup := providerWithFakeServer(t, server, []string{"typescript", "javascript"})
+	defer cleanup()
+
+	g := graph.New()
+	g.AddNode(&graph.Node{ID: "theme.css::bad", Kind: graph.KindFunction, Name: "bad", FilePath: "theme.css", StartLine: 1, EndLine: 1, Language: "typescript"})
+	g.AddNode(&graph.Node{ID: "main.ts::ok", Kind: graph.KindFunction, Name: "ok", FilePath: "main.ts", StartLine: 1, EndLine: 1, Language: "typescript"})
+
+	res, err := p.Enrich(g, repoRoot)
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.SymbolsTotal)
+	assert.Nil(t, g.GetNode("theme.css::bad").Meta)
+	assert.NotNil(t, g.GetNode("main.ts::ok").Meta)
+
+	select {
+	case uri := <-opened:
+		assert.Contains(t, uri, "main.ts")
+		assert.NotContains(t, uri, "theme.css")
+	case <-time.After(time.Second):
+		t.Fatal("expected didOpen for supported file")
+	}
+	select {
+	case uri := <-opened:
+		assert.NotContains(t, uri, "theme.css")
+	default:
+	}
+}

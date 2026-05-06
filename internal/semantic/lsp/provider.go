@@ -283,15 +283,38 @@ func (p *Provider) EnrichFile(g *graph.Graph, repoRoot, filePath string) (*seman
 }
 
 func (p *Provider) nodeMatches(n *graph.Node, repoRoot string) bool {
-	if n == nil {
+	if n == nil || !p.languageMatches(n.Language) {
 		return false
 	}
-	return p.languageMatches(n.Language)
+	return p.supportsFile(diskRelPath(repoRoot, n.FilePath))
 }
 
 func (p *Provider) languageMatches(language string) bool {
 	for _, lang := range p.languages {
 		if language == lang {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Provider) supportsFile(relPath string) bool {
+	ext := strings.ToLower(filepath.Ext(relPath))
+	for _, lang := range p.languages {
+		switch lang {
+		case "typescript":
+			if ext == ".ts" || ext == ".tsx" || ext == ".mts" || ext == ".cts" {
+				return true
+			}
+		case "javascript":
+			if ext == ".js" || ext == ".jsx" || ext == ".mjs" || ext == ".cjs" {
+				return true
+			}
+		case "go":
+			if ext == ".go" {
+				return true
+			}
+		default:
 			return true
 		}
 	}
@@ -347,6 +370,9 @@ func (p *Provider) ensureClient(workspaceRoot string) error {
 
 // openDocument sends textDocument/didOpen for a file.
 func (p *Provider) openDocument(repoRoot, relPath string) error {
+	if !p.supportsFile(relPath) {
+		return fmt.Errorf("unsupported LSP document extension: %s", relPath)
+	}
 	absPath := filepath.Join(repoRoot, relPath)
 	content, err := os.ReadFile(absPath)
 	if err != nil {
