@@ -18,6 +18,7 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/resolver"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/semantic"
 )
 
 // RepoMetadata holds per-repo indexing state.
@@ -35,15 +36,16 @@ type RepoMetadata struct {
 
 // MultiIndexer orchestrates indexing across multiple repositories.
 type MultiIndexer struct {
-	graph     *graph.Graph
-	registry  *parser.Registry
-	search    search.Backend
-	embedder  embedding.Provider
-	repos     map[string]*RepoMetadata // repoPrefix → metadata
-	indexers  map[string]*Indexer      // repoPrefix → per-repo indexer
-	configMgr *config.ConfigManager
-	logger    *zap.Logger
-	mu        sync.RWMutex
+	graph       *graph.Graph
+	registry    *parser.Registry
+	search      search.Backend
+	embedder    embedding.Provider
+	semanticMgr *semantic.Manager
+	repos       map[string]*RepoMetadata // repoPrefix → metadata
+	indexers    map[string]*Indexer      // repoPrefix → per-repo indexer
+	configMgr   *config.ConfigManager
+	logger      *zap.Logger
+	mu          sync.RWMutex
 }
 
 // SetEmbedder installs the embedding provider every per-repo indexer
@@ -55,6 +57,15 @@ func (mi *MultiIndexer) SetEmbedder(e embedding.Provider) {
 	mi.mu.Lock()
 	defer mi.mu.Unlock()
 	mi.embedder = e
+}
+
+// SetSemanticManager installs the semantic enrichment manager every per-repo
+// indexer should use. Must be called before IndexAll / TrackRepo; otherwise
+// multi-repo indexing creates fresh Indexers with no semantic pass wired.
+func (mi *MultiIndexer) SetSemanticManager(m *semantic.Manager) {
+	mi.mu.Lock()
+	defer mi.mu.Unlock()
+	mi.semanticMgr = m
 }
 
 // NewMultiIndexer creates a MultiIndexer.
@@ -171,6 +182,9 @@ func (mi *MultiIndexer) indexSingleRepo(entry config.RepoEntry) (map[string]*Ind
 	if mi.embedder != nil {
 		idx.SetEmbedder(mi.embedder)
 	}
+	if mi.semanticMgr != nil {
+		idx.SetSemanticManager(mi.semanticMgr)
+	}
 	entryCopy := entry
 	idx.SetWorkspaceID(resolveWorkspaceID(&entryCopy, cfg, prefix))
 	idx.SetProjectID(resolveProjectID(&entryCopy, cfg, prefix))
@@ -259,6 +273,9 @@ func (mi *MultiIndexer) indexMultiRepo(repos []config.RepoEntry) (map[string]*In
 			idx.search = mi.search
 			if mi.embedder != nil {
 				idx.SetEmbedder(mi.embedder)
+			}
+			if mi.semanticMgr != nil {
+				idx.SetSemanticManager(mi.semanticMgr)
 			}
 			idx.SetRepoPrefix(prefix)
 			entryCopy := e

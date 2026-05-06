@@ -17,6 +17,7 @@ import (
 	"github.com/zzet/gortex/internal/parser"
 	"github.com/zzet/gortex/internal/parser/languages"
 	"github.com/zzet/gortex/internal/search"
+	"github.com/zzet/gortex/internal/semantic"
 )
 
 // newTestConfigManager creates a ConfigManager with an empty GlobalConfig
@@ -207,6 +208,34 @@ func TestMultiIndexer_IndexAll_MultiRepoLoadsWorkspaceExclude(t *testing.T) {
 			assert.Equal(t, "api", n.ProjectID)
 		}
 	}
+}
+
+func TestMultiIndexer_IndexAll_PropagatesSemanticManager(t *testing.T) {
+	repoA := setupRepoDir(t, "repo-a")
+	repoB := setupRepoDir(t, "repo-b")
+
+	tmpCfg := filepath.Join(t.TempDir(), "config.yaml")
+	gc := &config.GlobalConfig{
+		Repos: []config.RepoEntry{
+			{Path: repoA, Name: "repo-a"},
+			{Path: repoB, Name: "repo-b"},
+		},
+	}
+	gc.SetConfigPath(tmpCfg)
+	require.NoError(t, gc.Save())
+
+	cm, err := config.NewConfigManager(tmpCfg)
+	require.NoError(t, err)
+
+	semMgr := semantic.NewManager(semantic.Config{Enabled: true}, zap.NewNop())
+	mi := NewMultiIndexer(graph.New(), newTestRegistry(), search.NewBM25(), cm, zap.NewNop())
+	mi.SetSemanticManager(semMgr)
+
+	_, err = mi.IndexAll()
+	require.NoError(t, err)
+
+	require.Same(t, semMgr, mi.indexers["repo-a"].SemanticManager())
+	require.Same(t, semMgr, mi.indexers["repo-b"].SemanticManager())
 }
 
 func TestMultiIndexer_IndexRepo(t *testing.T) {
